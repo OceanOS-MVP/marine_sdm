@@ -409,10 +409,11 @@ gbif_download_list <- batch_download(
 Here, we bring together the cleaned occurrence data and the environmental variables. We begin by reading in environmental data from multiple netCDF files and processes them using spatial tools (such as stars, terra, and sf) to ensure that they are correctly aligned with the occurrence data. The code then cleans and standardizes date information, splits occurrence data into target species and background (non-target) groups, and extracts the relevant environmental values at the occurrence locations by matching them by year and month. This matching ensures that the models account for temporal variability in the marine environment, which is particularly important in ecosystems that experience rapid environmental shifts and for species that may rapidly migrate to stay within the most favourable environmental conditions.
 
 ```{r preprocessing, eval=FALSE}
+library(tidyverse)
 library(fs)
 library(sf)
 library(arrow)
-library(star)
+library(stars)
 library(terra)
 library(tidyterra)
 library(tidysdm)
@@ -421,7 +422,8 @@ library(tidysdm)
 
 # Find and index parquet files
 files <- fs::dir_ls(
-  path = "outputs/gbif/parquet/",
+  #path = "outputs/gbif/parquet/",
+  path = "../research/outputs/gbif/parquet/",
   recurse = TRUE,
   type = "file")
 # Filter out files with size 0 bytes
@@ -449,7 +451,8 @@ clean_dates <- function(dates) {
 
 # Collect occurrence data
 df_occs <- ds %>%
-  filter(phylum == "Chordata") %>%
+  #filter(phylum == "Chordata") %>%
+  filter(order == "Perciformes") %>%
   filter(!class %in% c('Aves', 'Insecta')) %>%
   filter(taxonrank %in% c("SPECIES", "SUBSPECIES", "VARIETY")) %>%
   filter(basisofrecord %in% c(
@@ -473,13 +476,8 @@ df_occs <- ds %>%
     eventdate = clean_dates(eventdate)
     )
 
-# UK invasive species
-target_species <- c(
-  # "Sargassum muticum (Yendo) Fensholt" = 3197314L,
-  # "Crepidula fornicata (Linnaeus, 1758)" = 5192789L,
-  # "Styela clava Herdman, 1881" = 2331942L,
-  # "Eriocheir sinensis H.Milne Edwards, 1853" = 2225776L
-  "Magallana gigas (Thunberg, 1793)" = 7820753L)
+# e.g. Sand eel
+target_species <- c("Hyperoplus lanceolatus (Le Sauvage, 1824)" = 2390014L)
 
 # Records for target species only
 df_occs_target <- df_occs %>%
@@ -488,24 +486,22 @@ df_occs_target <- df_occs %>%
   filter(occurrencestatus == "PRESENT") %>%
   mutate(yearmonth = format(eventdate, "%Y%m")) %>%
   select(-eventdate, -occurrencestatus, -individualcount) %>%
-  st_as_sf(coords = c('lon', 'lat'), crs = 4326) %>%
-  distinct()
+  st_as_sf(coords = c('lon', 'lat'), crs = 4326)
 
-# Records for all other vertebrates  
+# Records for all other molluscs  
 df_occs_background <- df_occs %>%
   filter(!taxonkey %in% target_species) %>%
   filter(eventdate >= '1993-01-01') %>%
   filter(occurrencestatus == "PRESENT") %>%
   mutate(yearmonth = format(eventdate, "%Y%m")) %>%
   select(-eventdate, -occurrencestatus, -individualcount) %>%
-  st_as_sf(coords = c('lon', 'lat'), crs = 4326) %>%
-  distinct()
+  st_as_sf(coords = c('lon', 'lat'), crs = 4326)
 
 # Loading Environmental Data ---------------------------------------------------
 
 # List all netCDF files in the specified directory
 all_nc_files <- dir_ls(
-  path = "outputs/copernicus/raw/",
+  path = "../research/outputs/copernicus/raw/",
   recurse = TRUE,
   type = "file",
   glob = "*.nc")
@@ -569,7 +565,7 @@ env_target <- df_occs_target %>%
 df_env_target <- do.call(rbind, env_target)
 
 # Second for background group occurrences
-env_background <- df_occs_target %>%
+env_background <- df_occs_background %>%
   group_by(yearmonth) %>%
   group_split() %>%
   map(function(occ_points) {
@@ -586,9 +582,14 @@ env_background <- df_occs_target %>%
 df_env_background <- do.call(rbind, env_background)
 
 # Combine all observations for training
-df_enf <- bind_rows(
-  mutate(env_background, class = 1),
-  mutate(env_background, class = 0))
+df_env <- bind_rows(
+  mutate(df_env_target, class = 1),
+  mutate(df_env_background, class = 0)) %>%
+  # drop incomplete records
+  filter(complete.cases(st_drop_geometry(.)))
+# CHeck records for modelling
+df_env$class %>% table()
+write_rds(df_env, file = "df_env.rds")
 ```
 
 
@@ -601,6 +602,7 @@ Finally, we use the relatively established `tidysdm` workflow to create a number
 # Select variables with at least 10% contrast between presence and background,
 # then remove collinear predictors (cutoff = 0.8) to ensure a robust model.
 r_selected <- df_env %>%
+  st_drop_geometry()
   dist_pres_vs_bg(class) %>%
   .[. >= 0.1] %>%
   { r[[names(.)]] } %>%
